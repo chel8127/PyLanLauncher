@@ -32,7 +32,6 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMimeData, QPropertyAnimation,
 from PyQt6.QtGui import QPixmap, QDrag, QColor
 from datetime import datetime
 
-# --- КОНФИГУРАЦИЯ ---
 LAUNCHER_NAME = "PyLan Launcher"
 BASE_DIR = minecraft_launcher_lib.utils.get_minecraft_directory().replace("minecraft", LAUNCHER_NAME.lower())
 DATA_FILE = os.path.join(BASE_DIR, "instances.json")
@@ -53,11 +52,10 @@ def hide_console_if_frozen():
     try:
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
         if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
     except Exception:
         pass
 
-# --- ОКНО НОВОСТЕЙ ---
 class MinecraftNewsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -130,7 +128,6 @@ class MinecraftNewsDialog(QDialog):
             return
         os.startfile(self.news_links[row])
 
-# --- ОКНО МОДОВ ---
 class ModsManagerDialog(QDialog):
     def __init__(self, instance_data, parent=None, all_instances=None):
         super().__init__(parent)
@@ -633,7 +630,7 @@ class InstanceCard(QFrame):
         mime.setText(self.instance_data.get("path", ""))
         drag.setMimeData(mime)
         drag.exec(Qt.DropAction.MoveAction)
-# --- ПОТОК ЗАПУСКА ---
+
 class LaunchThread(QThread):
     progress = pyqtSignal(int, str)
     log_line = pyqtSignal(str)
@@ -775,7 +772,6 @@ class ModSearchThread(QThread):
         except Exception as e:
             self.failed.emit(self.request_id, str(e))
 
-# --- ГЛАВНОЕ ОКНО ---
 class LauncherMain(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1014,13 +1010,12 @@ class LauncherMain(QMainWindow):
         cutoff = time.time() - days * 86400
         removed = 0
         try:
-            # launcher backups
             bdir = self.backups_dir()
             for fn in os.listdir(bdir):
                 p = os.path.join(bdir, fn)
                 if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
                     os.remove(p); removed += 1
-            # temp java archives
+            
             jdir = os.path.join(BASE_DIR, "java")
             if os.path.exists(jdir):
                 for root, _, files in os.walk(jdir):
@@ -1029,7 +1024,7 @@ class LauncherMain(QMainWindow):
                             p = os.path.join(root, fn)
                             if os.path.getmtime(p) < cutoff:
                                 os.remove(p); removed += 1
-            # per-instance logs and old crash reports
+            
             for inst in self.get_all_instances():
                 ip = inst.get("path", "")
                 for rel in ["logs", "crash-reports"]:
@@ -1592,7 +1587,6 @@ class LauncherMain(QMainWindow):
             hex_color = color.name()
             self.settings.setdefault("custom_theme", {})[setting_key] = hex_color
             button.setStyleSheet(f"background-color: {hex_color}; border-radius: 8px; border: 1px solid #555;")
-            # If the custom theme is active, re-apply it immediately
             if self.settings.get("theme") == "custom":
                 self.apply_theme()
                 self.refresh_theme_widgets()
@@ -1606,7 +1600,7 @@ class LauncherMain(QMainWindow):
         self.main_splitter.setChildrenCollapsible(False)
         main_layout.addWidget(self.main_splitter)
 
-        # 1. SIDEBAR
+
         self.sidebar = QFrame(); self.sidebar.setObjectName("Sidebar"); self.sidebar.setFixedWidth(int(self.settings.get("sidebar_width", 70)))
         side_l = QVBoxLayout(self.sidebar); side_l.setContentsMargins(0, 20, 0, 0); side_l.setAlignment(Qt.AlignmentFlag.AlignTop)
         
@@ -1624,7 +1618,6 @@ class LauncherMain(QMainWindow):
         side_l.addWidget(self.side_settings)
         self.main_splitter.addWidget(self.sidebar)
 
-        # 2. ЦЕНТРАЛЬНЫЕ СТРАНИЦЫ
         center_host = QWidget()
         center_host_l = QVBoxLayout(center_host)
         center_host_l.setContentsMargins(0, 0, 0, 0)
@@ -1655,7 +1648,6 @@ class LauncherMain(QMainWindow):
         center_host_l.addWidget(self.pages)
         self.main_splitter.addWidget(center_host)
 
-        # Библиотека установок
         self.page_library = QWidget()
         cl = QVBoxLayout(self.page_library); cl.setContentsMargins(30, 30, 30, 30)
         header = QHBoxLayout()
@@ -1678,7 +1670,6 @@ class LauncherMain(QMainWindow):
         self.scroll.setWidget(self.grid_w); cl.addWidget(self.scroll)
         self.pages.addWidget(self.page_library)
 
-        # Новости
         self.page_news = QWidget()
         nl = QVBoxLayout(self.page_news); nl.setContentsMargins(24, 24, 24, 24); nl.setSpacing(12)
         news_head = QHBoxLayout()
@@ -1694,7 +1685,6 @@ class LauncherMain(QMainWindow):
         self.news_scroll.setWidget(self.news_wrap); nl.addWidget(self.news_scroll)
         self.pages.addWidget(self.page_news)
 
-        # Моды
         self.page_mods = QWidget()
         ml = QVBoxLayout(self.page_mods); ml.setContentsMargins(24, 24, 24, 24); ml.setSpacing(12)
         mods_head = QHBoxLayout()
@@ -1750,7 +1740,6 @@ class LauncherMain(QMainWindow):
         self.mods_scroll.setWidget(self.mods_wrap); ml.addWidget(self.mods_scroll)
         self.pages.addWidget(self.page_mods)
 
-        # Консоль
         self.page_console = QWidget()
         conl = QVBoxLayout(self.page_console); conl.setContentsMargins(24, 24, 24, 24); conl.setSpacing(12)
         con_head = QHBoxLayout()
@@ -1776,7 +1765,6 @@ class LauncherMain(QMainWindow):
         conl.addWidget(self.console_output)
         self.pages.addWidget(self.page_console)
 
-        # Настройки
         self.page_settings = QWidget()
         self.page_settings.setStyleSheet("QLabel { color: white; }")
         sl = QVBoxLayout(self.page_settings); sl.setContentsMargins(30, 30, 30, 30); sl.setSpacing(16)
@@ -1894,7 +1882,6 @@ class LauncherMain(QMainWindow):
         self.sidebar_color_btn.setStyleSheet(f"background-color: {custom_theme_settings.get('side_active', '#4A8DF0')}; border-radius: 8px; border: 1px solid #555;")
 
 
-        # 3. ИНСПЕКТОР (Правая панель)
         self.inspector = QFrame(); self.inspector.setObjectName("Inspector"); self.inspector.setVisible(False)
         self.ins_l = QVBoxLayout(self.inspector); self.ins_l.setContentsMargins(20, 40, 20, 20)
         
@@ -1908,7 +1895,6 @@ class LauncherMain(QMainWindow):
         
         self.ins_l.addSpacing(30)
         
-        # Основные действия (вернулись в инспектор)
         self.btn_launch = QPushButton("▶ Запустить"); self.btn_launch.setObjectName("ActionBtn"); self.btn_launch.clicked.connect(self.handle_launch)
         self.btn_stop = QPushButton("⏹ Остановить"); self.btn_stop.setObjectName("ActionBtn"); self.btn_stop.clicked.connect(self.force_stop_minecraft)
         self.btn_folder = QPushButton("📁 Папка"); self.btn_folder.setObjectName("ActionBtn"); self.btn_folder.clicked.connect(self.open_instance_folder)
@@ -1922,7 +1908,6 @@ class LauncherMain(QMainWindow):
 
         self.ins_l.addSpacing(12)
 
-        # Кнопка "Изменить..." с меню действий
         self.edit_btn = QPushButton("Изменить…")
         self.edit_btn.setObjectName("ActionBtn")
         self.edit_menu = QMenu(self)
@@ -2218,10 +2203,8 @@ class LauncherMain(QMainWindow):
             pasted = pasted_url.strip()
             auth_code = None
             try:
-                # Standard case: full redirected URL
                 auth_code = minecraft_launcher_lib.microsoft_account.parse_auth_code_url(pasted, state)
             except Exception:
-                # Fallback: user pasted only code or query part
                 raw = pasted
                 if raw.startswith("code="):
                     raw = raw[5:]
@@ -2294,15 +2277,12 @@ class LauncherMain(QMainWindow):
                         pass
 
         login_data = None
-        # 1) Custom Azure App with localhost callback (auto, no manual copy)
         if custom_client_id:
             try:
                 login_data = login_loopback(custom_client_id)
             except Exception as e:
                 self.log_event(f"Microsoft loopback login fallback: {e}")
-                # fallback below
 
-        # 2) Reliable fallback: official desktop redirect + manual URL paste
         if login_data is None:
             login_data = login_desktop_manual()
             if login_data is None:
@@ -2703,7 +2683,6 @@ class LauncherMain(QMainWindow):
         down_btn.clicked.connect(lambda: self._move_asset_priority(asset_dir(), local_list, 1, refill_local))
         refill_local()
 
-        # online
         online_tab = QWidget(); ol = QVBoxLayout(online_tab)
         ol.setSpacing(10)
         qrow = QHBoxLayout()
@@ -2922,7 +2901,6 @@ class LauncherMain(QMainWindow):
         file_info = self._resolve_curseforge_file(mod_id, inst, headers)
 
         for dep in file_info.get("dependencies", []):
-            # relationType=3 -> required dependency
             if dep.get("relationType") == 3 and dep.get("modId"):
                 dep_id = dep.get("modId")
                 self.log_event(f"CurseForge dependency: {dep_id}")
@@ -4328,7 +4306,6 @@ $Shortcut.Save()
         if account.get("type") == "microsoft":
             refreshed = self.refresh_microsoft_account_token(account)
             account = refreshed or account
-            # persist refreshed token in settings for next launches
             accounts = self.settings.get("accounts", [])
             idx = int(self.settings.get("active_account", 0))
             if 0 <= idx < len(accounts):
