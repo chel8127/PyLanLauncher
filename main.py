@@ -17,6 +17,7 @@ import shutil
 import webbrowser
 import glob
 import tempfile
+import shlex
 import minecraft_launcher_lib
 try:
     from pypresence import Presence
@@ -43,6 +44,13 @@ GITHUB_LATEST_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest
 
 if not os.path.exists(BASE_DIR): os.makedirs(BASE_DIR)
 
+def _subprocess_no_window_kwargs():
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {"startupinfo": startupinfo, "creationflags": subprocess.CREATE_NO_WINDOW}
 
 def hide_console_if_frozen():
     if os.name != "nt":
@@ -630,7 +638,7 @@ class InstanceCard(QFrame):
         mime.setText(self.instance_data.get("path", ""))
         drag.setMimeData(mime)
         drag.exec(Qt.DropAction.MoveAction)
-
+# --- ПОТОК ЗАПУСКА ---
 class LaunchThread(QThread):
     progress = pyqtSignal(int, str)
     log_line = pyqtSignal(str)
@@ -659,6 +667,10 @@ class LaunchThread(QThread):
             installer = self.data.get('installer', 'vanilla')
             loader_version = self.data.get('loader_version') or None
             ram_mb = int(self.data.get("ram_mb", 2048))
+            ram_min_mb = int(self.data.get("ram_min_mb", 1024))
+            ram_max_mb = int(self.data.get("ram_max_mb", ram_mb))
+            if ram_min_mb > ram_max_mb:
+                ram_min_mb, ram_max_mb = ram_max_mb, ram_min_mb
             account = self.data.get("account") or {}
             java_path = (self.data.get("java_path") or "").strip()
             callback = {
@@ -686,11 +698,18 @@ class LaunchThread(QThread):
             else:
                 minecraft_launcher_lib.install.install_minecraft_version(mc_version, p, callback=callback)
             is_ms = account.get("type") == "microsoft"
+            extra_jvm = []
+            try:
+                extra_raw = str(self.data.get("jvm_args", "") or "").strip()
+                if extra_raw:
+                    extra_jvm = shlex.split(extra_raw)
+            except Exception:
+                extra_jvm = []
             opt = {
                 "username": account.get("username", "Player"),
                 "uuid": account.get("uuid", "0"),
                 "token": account.get("access_token", "0") if is_ms else "0",
-                "jvmArguments": [f"-Xms1024M", f"-Xmx{ram_mb}M"]
+                "jvmArguments": [f"-Xms{ram_min_mb}M", f"-Xmx{ram_max_mb}M"] + extra_jvm
             }
             if java_path:
                 opt["executablePath"] = java_path
@@ -772,6 +791,30 @@ class ModSearchThread(QThread):
         except Exception as e:
             self.failed.emit(self.request_id, str(e))
 
+class ModInstallThread(QThread):
+    done = pyqtSignal(bool, str, list)
+    log = pyqtSignal(str)
+
+    def __init__(self, launcher, mods, inst):
+        super().__init__()
+        self.launcher = launcher
+        self.mods = mods or []
+        self.inst = inst or {}
+
+    def run(self):
+        installed_files = []
+        try:
+            self.launcher.create_instance_backup(self.inst, reason="before_mod_install")
+            index_data = self.launcher.read_mods_index(self.inst)
+            for mod in self.mods:
+                title = mod.get("title", "Unknown")
+                self.log.emit(f"Установка мода: {title}")
+                self.launcher._install_modrinth_project_recursive(mod["id"], self.inst, set(), installed_files, index_data=index_data)
+            self.launcher.write_mods_index(self.inst, index_data)
+            self.done.emit(True, "", installed_files)
+        except Exception as e:
+            self.done.emit(False, str(e), installed_files)
+
 class LauncherMain(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -783,6 +826,7 @@ class LauncherMain(QMainWindow):
         self.selected_instance = None
         self.news_items = []
         self.mods_results = []
+        self.mods_selected = set()
         self.mods_page = 0
         self.mods_page_size = 25
         self.mods_has_next = False
@@ -850,6 +894,13 @@ class LauncherMain(QMainWindow):
                         data["active_account"] = 0
                     return data
             except Exception:
+                try:
+                    bad = SETTINGS_FILE + ".bad"
+                    if os.path.exists(bad):
+                        os.remove(bad)
+                    os.replace(SETTINGS_FILE, bad)
+                except Exception:
+                    pass
                 return default
         return default
 
@@ -893,7 +944,6 @@ class LauncherMain(QMainWindow):
                 return
             if self.version_tuple(tag) > self.version_tuple(APP_VERSION):
                 last_shown = str(self.settings.get("last_notified_github_release", "")).strip()
-                # Автопроверка: не спамим одним и тем же релизом
                 if manual or last_shown != tag:
                     self.settings["last_notified_github_release"] = tag
                     self.save_settings()
@@ -1010,12 +1060,13 @@ class LauncherMain(QMainWindow):
         cutoff = time.time() - days * 86400
         removed = 0
         try:
+            # launcher backups
             bdir = self.backups_dir()
             for fn in os.listdir(bdir):
                 p = os.path.join(bdir, fn)
                 if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
                     os.remove(p); removed += 1
-            
+            # temp java archives
             jdir = os.path.join(BASE_DIR, "java")
             if os.path.exists(jdir):
                 for root, _, files in os.walk(jdir):
@@ -1024,7 +1075,7 @@ class LauncherMain(QMainWindow):
                             p = os.path.join(root, fn)
                             if os.path.getmtime(p) < cutoff:
                                 os.remove(p); removed += 1
-            
+            # per-instance logs and old crash reports
             for inst in self.get_all_instances():
                 ip = inst.get("path", "")
                 for rel in ["logs", "crash-reports"]:
@@ -1174,9 +1225,9 @@ class LauncherMain(QMainWindow):
     def is_discord_running(self):
         try:
             if os.name == "nt":
-                out = subprocess.check_output(["tasklist"], text=True, errors="ignore")
+                out = subprocess.check_output(["tasklist"], text=True, errors="ignore", **_subprocess_no_window_kwargs())
                 return ("discord.exe" in out.lower()) or ("discordcanary.exe" in out.lower()) or ("discordptb.exe" in out.lower())
-            out = subprocess.check_output(["ps", "aux"], text=True, errors="ignore")
+            out = subprocess.check_output(["ps", "aux"], text=True, errors="ignore", **_subprocess_no_window_kwargs())
             return "discord" in out.lower()
         except Exception:
             return False
@@ -1384,7 +1435,13 @@ class LauncherMain(QMainWindow):
 
     def _java_version_info(self, java_exe):
         try:
-            out = subprocess.check_output([java_exe, "-version"], stderr=subprocess.STDOUT, text=True, timeout=7)
+            out = subprocess.check_output(
+                [java_exe, "-version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=7,
+                **_subprocess_no_window_kwargs()
+            )
             line = out.splitlines()[0] if out else ""
             m = re.search(r"version\s+\"([^\"]+)\"", line)
             ver = m.group(1) if m else line.strip()
@@ -1419,7 +1476,13 @@ class LauncherMain(QMainWindow):
 
         for ex in ["javaw.exe", "java.exe"]:
             try:
-                out = subprocess.check_output(["where", ex], text=True, stderr=subprocess.STDOUT, timeout=5)
+                out = subprocess.check_output(
+                    ["where", ex],
+                    text=True,
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                    **_subprocess_no_window_kwargs()
+                )
                 for line in out.splitlines():
                     add_candidate(line.strip(), "PATH")
             except Exception:
@@ -1516,6 +1579,63 @@ class LauncherMain(QMainWindow):
             "emerald": {"name": "Emerald", "accent": "#00A66A", "accent2": "#3CCB93", "side_active": "#00C07A"},
             "sunset": {"name": "Sunset", "accent": "#D46B00", "accent2": "#F0994A", "side_active": "#FF8A1F"},
             "rose": {"name": "Rose", "accent": "#C63E65", "accent2": "#EA6C8F", "side_active": "#E0527A"},
+            "light": {
+                "name": "Светлая",
+                "accent": "#0078D4",
+                "accent2": "#4A8DF0",
+                "side_active": "#0078D4",
+                "bg": "#F4F6F9",
+                "panel": "#FFFFFF",
+                "panel2": "#EEF2F6",
+                "card": "#F1F3F7",
+                "card_selected": "#E8EDF7",
+                "text": "#0F1114",
+                "text_muted": "#5A6372",
+                "border": "#D2D8E2",
+                "input_bg": "#FFFFFF",
+                "input_text": "#0F1114",
+                "input_border": "#C3CCD9",
+                "button_bg": "#E9EEF5",
+                "button_hover": "#DCE4EF"
+            },
+            "dark": {
+                "name": "Темная",
+                "accent": "#7A5CFF",
+                "accent2": "#9A84FF",
+                "side_active": "#7A5CFF",
+                "bg": "#0F0F0F",
+                "panel": "#121212",
+                "panel2": "#141414",
+                "card": "#181818",
+                "card_selected": "#1E1E1E",
+                "text": "#FFFFFF",
+                "text_muted": "#AAB4CA",
+                "border": "#333333",
+                "input_bg": "#1A1A1A",
+                "input_text": "#EEEEEE",
+                "input_border": "#333333",
+                "button_bg": "#222222",
+                "button_hover": "#282828"
+            },
+            "contrast": {
+                "name": "Контрастная",
+                "accent": "#FFD400",
+                "accent2": "#FFE766",
+                "side_active": "#FFD400",
+                "bg": "#000000",
+                "panel": "#000000",
+                "panel2": "#0A0A0A",
+                "card": "#000000",
+                "card_selected": "#111111",
+                "text": "#FFFFFF",
+                "text_muted": "#FFFFFF",
+                "border": "#FFFFFF",
+                "input_bg": "#000000",
+                "input_text": "#FFFFFF",
+                "input_border": "#FFFFFF",
+                "button_bg": "#000000",
+                "button_hover": "#1A1A1A"
+            },
             "custom": {"name": "Своя тема"}
         }
 
@@ -1524,31 +1644,73 @@ class LauncherMain(QMainWindow):
         presets = self.theme_presets()
         if theme_id == "custom":
             custom_colors = self.settings.get("custom_theme", {})
-            base_colors = presets["blue"].copy()
+            base_colors = presets["dark"].copy() if "dark" in presets else presets["blue"].copy()
             base_colors.update(custom_colors)
             return base_colors
-        return presets.get(theme_id, presets["blue"])
+        base = presets.get(theme_id, presets["blue"]).copy()
+        base.setdefault("bg", "#0F0F0F")
+        base.setdefault("panel", "#121212")
+        base.setdefault("panel2", "#141414")
+        base.setdefault("card", "#181818")
+        base.setdefault("card_selected", "#1E1E1E")
+        base.setdefault("text", "#FFFFFF")
+        base.setdefault("text_muted", "#AAB4CA")
+        base.setdefault("border", "#333333")
+        base.setdefault("input_bg", "#1A1A1A")
+        base.setdefault("input_text", "#EEEEEE")
+        base.setdefault("input_border", "#333333")
+        base.setdefault("button_bg", "#222222")
+        base.setdefault("button_hover", "#282828")
+        return base
 
     def apply_theme(self):
         pal = self.theme_palette()
         accent = pal["accent"]
         side_active = pal["side_active"]
+        bg = pal["bg"]
+        panel = pal["panel"]
+        panel2 = pal["panel2"]
+        card = pal["card"]
+        card_selected = pal["card_selected"]
+        text = pal["text"]
+        text_muted = pal["text_muted"]
+        border = pal["border"]
+        input_bg = pal["input_bg"]
+        input_text = pal["input_text"]
+        input_border = pal["input_border"]
+        button_bg = pal["button_bg"]
+        button_hover = pal["button_hover"]
         self.setStyleSheet(f"""
-            QMainWindow {{ background: #0F0F0F; font-family: 'Segoe UI'; }}
-            #Sidebar {{ background: #121212; border-right: 1px solid #222; }}
-            #SideBtn {{ background: transparent; border: none; color: white; font-size: 18px; padding: 15px; }}
-            #SideBtn:hover {{ color: white; background: #1A1A1A; }}
-            #SideBtn[active="true"] {{ color: {side_active}; border-left: 3px solid {side_active}; background: #1A1A1A; }}
-            #Inspector {{ background: #141414; border-left: 1px solid #252525; min-width: 300px; }}
-            #Card {{ background: #181818; border: 1px solid #333; border-radius: 12px; }}
-            #Card[selected="true"] {{ border: 2px solid {accent}; background: #1E1E1E; }}
+            QMainWindow {{ background: {bg}; font-family: 'Segoe UI'; color: {text}; }}
+            QLabel {{ color: {text}; }}
+            #Sidebar {{ background: {panel}; border-right: 1px solid {border}; }}
+            #SideBtn {{ background: transparent; border: none; color: {text}; font-size: 18px; padding: 15px; }}
+            #SideBtn:hover {{ color: {text}; background: {panel2}; }}
+            #SideBtn[active="true"] {{ color: {side_active}; border-left: 3px solid {side_active}; background: {panel2}; }}
+            #Inspector {{ background: {panel2}; border-left: 1px solid {border}; min-width: 300px; }}
+            #Card {{ background: {card}; border: 1px solid {border}; border-radius: 12px; }}
+            #Card[selected="true"] {{ border: 2px solid {accent}; background: {card_selected}; }}
             #PlayBtn {{ background: {accent}; color: white; font-weight: bold; border-radius: 8px; height: 48px; border: none; }}
-            #ActionBtn {{ background: #222; color: white; border-radius: 6px; padding: 12px; text-align: left; border: 1px solid #333; }}
-            #ActionBtn:hover {{ background: #282828; color: white; }}
-            QMenu {{ background: #1A1A1A; color: white; border: 1px solid #333; }}
+            #ActionBtn {{ background: {button_bg}; color: {text}; border-radius: 6px; padding: 12px; text-align: left; border: 1px solid {border}; }}
+            #ActionBtn:hover {{ background: {button_hover}; color: {text}; }}
+            QLineEdit, QTextEdit, QListWidget, QComboBox, QSpinBox {{
+                background: {input_bg}; color: {input_text}; border: 1px solid {input_border}; border-radius: 8px; padding: 6px;
+            }}
+            QCheckBox {{ color: {text}; }}
+            QCheckBox::indicator {{
+                width: 16px; height: 16px;
+                border: 1px solid {border};
+                border-radius: 3px;
+                background: {input_bg};
+            }}
+            QCheckBox::indicator:checked {{
+                background: {accent};
+                border: 1px solid {accent};
+            }}
+            QMenu {{ background: {panel}; color: {text}; border: 1px solid {border}; }}
             QMenu::item {{ padding: 6px 16px; }}
             QMenu::item:selected {{ background: {accent}; color: white; }}
-            QProgressBar {{ background: #000; border-radius: 2px; height: 4px; border: none; }}
+            QProgressBar {{ background: {panel2}; border-radius: 2px; height: 4px; border: none; }}
             QProgressBar::chunk {{ background: {accent}; }}
         """)
 
@@ -1570,9 +1732,17 @@ class LauncherMain(QMainWindow):
                 if w is None:
                     continue
                 if name == "account_btn":
-                    w.setStyleSheet("background:#202020;color:white;border:1px solid #333;border-radius:8px;padding:8px 12px;")
+                    pal = self.theme_palette()
+                    w.setStyleSheet(
+                        f"background:{pal['button_bg']};color:{pal['text']};"
+                        f"border:1px solid {pal['border']};border-radius:8px;padding:8px 12px;"
+                    )
                 elif name == "check_updates_btn":
-                    w.setStyleSheet("background:#252525;color:white;border:1px solid #333;border-radius:8px;padding:8px 14px;")
+                    pal = self.theme_palette()
+                    w.setStyleSheet(
+                        f"background:{pal['button_bg']};color:{pal['text']};"
+                        f"border:1px solid {pal['border']};border-radius:8px;padding:8px 14px;"
+                    )
                 else:
                     w.setStyleSheet(css)
 
@@ -1587,6 +1757,7 @@ class LauncherMain(QMainWindow):
             hex_color = color.name()
             self.settings.setdefault("custom_theme", {})[setting_key] = hex_color
             button.setStyleSheet(f"background-color: {hex_color}; border-radius: 8px; border: 1px solid #555;")
+            # If the custom theme is active, re-apply it immediately
             if self.settings.get("theme") == "custom":
                 self.apply_theme()
                 self.refresh_theme_widgets()
@@ -1599,7 +1770,6 @@ class LauncherMain(QMainWindow):
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
         main_layout.addWidget(self.main_splitter)
-
 
         self.sidebar = QFrame(); self.sidebar.setObjectName("Sidebar"); self.sidebar.setFixedWidth(int(self.settings.get("sidebar_width", 70)))
         side_l = QVBoxLayout(self.sidebar); side_l.setContentsMargins(0, 20, 0, 0); side_l.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -1701,6 +1871,7 @@ class LauncherMain(QMainWindow):
         self.mods_search_btn = QPushButton("Искать")
         self.mods_search_btn.setStyleSheet("background:#0078D4;color:white;border:none;border-radius:8px;padding:8px 16px;font-weight:700;")
         self.mods_search_btn.clicked.connect(lambda: self.search_mods_page(reset_page=True))
+        self.mods_query.returnPressed.connect(lambda: self.search_mods_page(reset_page=True))
         mod_filters.addWidget(self.mods_provider); mod_filters.addWidget(self.mods_query); mod_filters.addWidget(self.mods_search_btn)
         ml.addLayout(mod_filters)
 
@@ -1718,6 +1889,11 @@ class LauncherMain(QMainWindow):
         upd_row.addWidget(self.mods_update_all_btn)
         upd_row.addWidget(self.mods_conflicts_btn)
         upd_row.addStretch()
+        self.mods_install_selected_btn = QPushButton("Скачать выбранные")
+        self.mods_install_selected_btn.setStyleSheet("background:#00A66A;color:white;border:none;border-radius:8px;padding:7px 14px;font-weight:700;")
+        self.mods_install_selected_btn.clicked.connect(self.install_selected_mods)
+        self.mods_install_selected_btn.setEnabled(False)
+        upd_row.addWidget(self.mods_install_selected_btn)
         ml.addLayout(upd_row)
 
         mods_pager = QHBoxLayout()
@@ -1895,14 +2071,13 @@ class LauncherMain(QMainWindow):
         
         self.ins_l.addSpacing(30)
         
-        self.btn_launch = QPushButton("▶ Запустить"); self.btn_launch.setObjectName("ActionBtn"); self.btn_launch.clicked.connect(self.handle_launch)
         self.btn_stop = QPushButton("⏹ Остановить"); self.btn_stop.setObjectName("ActionBtn"); self.btn_stop.clicked.connect(self.force_stop_minecraft)
         self.btn_folder = QPushButton("📁 Папка"); self.btn_folder.setObjectName("ActionBtn"); self.btn_folder.clicked.connect(self.open_instance_folder)
         self.btn_copy = QPushButton("🧬 Копировать"); self.btn_copy.setObjectName("ActionBtn"); self.btn_copy.clicked.connect(self.duplicate_selected_instance)
         self.btn_shortcut = QPushButton("🚀 Создать ярлык"); self.btn_shortcut.setObjectName("ActionBtn"); self.btn_shortcut.clicked.connect(self.create_instance_shortcut)
         self.btn_delete = QPushButton("🗑 Удалить"); self.btn_delete.setObjectName("ActionBtn"); self.btn_delete.clicked.connect(self.delete_current)
         self.btn_delete.setStyleSheet("background:#2A1A1A;color:#FFB0B0;border:1px solid #6A2A2A;border-radius:6px;padding:12px;text-align:left;")
-        for b in [self.btn_launch, self.btn_stop, self.btn_folder, self.btn_copy, self.btn_shortcut, self.btn_delete]:
+        for b in [self.btn_stop, self.btn_folder, self.btn_copy, self.btn_shortcut, self.btn_delete]:
             self.ins_l.addWidget(b)
             b.setEnabled(False)
 
@@ -1952,7 +2127,7 @@ class LauncherMain(QMainWindow):
         else:
             java_txt = "auto"
         self.ins_info.setText(f"Minecraft {data['version']} | {installer} | Java: {java_txt}")
-        for b in [self.btn_launch, self.btn_stop, self.btn_folder, self.btn_copy, self.btn_shortcut, self.btn_delete]:
+        for b in [self.btn_stop, self.btn_folder, self.btn_copy, self.btn_shortcut, self.btn_delete]:
             b.setEnabled(True)
         self.edit_btn.setEnabled(True)
         self._update_edit_menu_state()
@@ -2203,6 +2378,7 @@ class LauncherMain(QMainWindow):
             pasted = pasted_url.strip()
             auth_code = None
             try:
+
                 auth_code = minecraft_launcher_lib.microsoft_account.parse_auth_code_url(pasted, state)
             except Exception:
                 raw = pasted
@@ -2282,6 +2458,7 @@ class LauncherMain(QMainWindow):
                 login_data = login_loopback(custom_client_id)
             except Exception as e:
                 self.log_event(f"Microsoft loopback login fallback: {e}")
+                # fallback below
 
         if login_data is None:
             login_data = login_desktop_manual()
@@ -2915,6 +3092,8 @@ class LauncherMain(QMainWindow):
             self.mods_page = 0
         query = self.mods_query.text().strip()
         self.mods_results = []
+        self.mods_selected = set()
+        self._update_mods_selected_ui()
         self._clear_layout(self.mods_l)
         self.mods_l.addWidget(QLabel("Загрузка модов..."))
         self.mods_search_btn.setEnabled(False)
@@ -2984,11 +3163,61 @@ class LauncherMain(QMainWindow):
             title = QLabel(mod.get("title", "Unknown")); title.setStyleSheet("color:white;font-size:16px;font-weight:800;")
             desc = QLabel(mod.get("description", "")); desc.setWordWrap(True); desc.setStyleSheet("color:#B9B9B9;")
             info.addWidget(title); info.addWidget(desc)
+            select_box = QCheckBox("Выбрать")
+            select_box.setStyleSheet("color:#CFE8D6;")
+            select_box.setChecked(mod.get("id") in self.mods_selected)
+            select_box.toggled.connect(lambda v, mid=mod.get("id"): self._toggle_mod_selected(mid, v))
             install_b = QPushButton("Установить")
             install_b.setStyleSheet("background:#0078D4;color:white;border:none;border-radius:8px;padding:8px 14px;font-weight:700;")
             install_b.clicked.connect(lambda _, m=mod: self.install_mod_to_selected_instance(m))
-            row.addLayout(info); row.addStretch(); row.addWidget(install_b)
+            row.addLayout(info); row.addStretch(); row.addWidget(select_box); row.addWidget(install_b)
             self.mods_l.addWidget(card)
+
+    def _toggle_mod_selected(self, mod_id, enabled):
+        if not mod_id:
+            return
+        if enabled:
+            self.mods_selected.add(mod_id)
+        else:
+            self.mods_selected.discard(mod_id)
+        self._update_mods_selected_ui()
+
+    def _update_mods_selected_ui(self):
+        if hasattr(self, "mods_install_selected_btn") and self.mods_install_selected_btn is not None:
+            self.mods_install_selected_btn.setEnabled(bool(self.mods_selected))
+
+    def install_selected_mods(self):
+        if not self.mods_selected:
+            QMessageBox.information(self, "Моды", "Выберите хотя бы один мод для загрузки.")
+            return
+        instances = self.get_all_instances()
+        if not instances:
+            QMessageBox.warning(self, "Ошибка", "Нет установок для установки модов.")
+            return
+        d = InstanceSelectDialog(instances, self)
+        if d.exec() != QDialog.DialogCode.Accepted:
+            return
+        inst = d.selected_instance()
+        if not inst:
+            return
+
+        mods = [m for m in self.mods_results if m.get("id") in self.mods_selected]
+        if not mods:
+            QMessageBox.information(self, "Моды", "Выбранные моды не найдены в текущем списке.")
+            return
+        self._start_mod_install(mods, inst)
+
+    def _on_mods_install_finished(self, ok, error, installed_files):
+        self.mods_install_selected_btn.setEnabled(True)
+        if ok:
+            summary = "\n".join(os.path.basename(x) for x in installed_files[:10])
+            if len(installed_files) > 10:
+                summary += f"\n... и ещё {len(installed_files) - 10}"
+            QMessageBox.information(self, "Готово", f"Установлено файлов: {len(installed_files)}\n{summary}")
+            self.log_event(f"Установка завершена. Файлов: {len(installed_files)}")
+        else:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось установить моды: {error}")
+            self.log_event(f"Ошибка установки модов: {error}")
 
     def install_mod_to_selected_instance(self, mod):
         instances = self.get_all_instances()
@@ -3001,23 +3230,21 @@ class LauncherMain(QMainWindow):
         inst = d.selected_instance()
         if not inst:
             return
+        self._start_mod_install([mod], inst)
 
-        self.log_event(f"Начата установка мода '{mod.get('title', 'Unknown')}' в {inst.get('name', 'Unnamed')} ({inst.get('version')})")
-        try:
-            self.create_instance_backup(inst, reason="before_mod_install")
-            index_data = self.read_mods_index(inst)
-            installed_files = []
-            self._install_modrinth_project_recursive(mod["id"], inst, set(), installed_files, index_data=index_data)
-            self.write_mods_index(inst, index_data)
-
-            summary = "\n".join(os.path.basename(x) for x in installed_files[:10])
-            if len(installed_files) > 10:
-                summary += f"\n... и ещё {len(installed_files) - 10}"
-            QMessageBox.information(self, "Готово", f"Установлено файлов: {len(installed_files)}\n{summary}")
-            self.log_event(f"Установка завершена. Файлов: {len(installed_files)}")
-        except Exception as e:
-            QMessageBox.warning(self, "Ошибка", f"Не удалось установить мод: {e}")
-            self.log_event(f"Ошибка установки мода: {e}")
+    def _start_mod_install(self, mods, inst):
+        if getattr(self, "mod_install_thread", None) is not None and self.mod_install_thread.isRunning():
+            QMessageBox.information(self, "Моды", "Дождитесь завершения текущей установки модов.")
+            return
+        if not mods:
+            return
+        if hasattr(self, "mods_install_selected_btn") and self.mods_install_selected_btn is not None:
+            self.mods_install_selected_btn.setEnabled(False)
+        self.log_event(f"Начата установка {len(mods)} модов в {inst.get('name', 'Unnamed')}")
+        self.mod_install_thread = ModInstallThread(self, mods, inst)
+        self.mod_install_thread.log.connect(self.log_event)
+        self.mod_install_thread.done.connect(lambda ok, err, files: self._on_mods_install_finished(ok, err, files))
+        self.mod_install_thread.start()
 
     def _latest_modrinth_version_info(self, project_id, inst):
         params = {"game_versions": json.dumps([inst.get("version")])}
@@ -3396,8 +3623,7 @@ class LauncherMain(QMainWindow):
         self.mods_conflicts_btn.setText(t["mods_conflicts"])
         if hasattr(self, "edit_btn"):
             self.edit_btn.setText(t["edit_btn"])
-        if hasattr(self, "btn_launch"):
-            self.btn_launch.setText("▶ " + t["menu_launch"])
+        if hasattr(self, "btn_stop"):
             self.btn_stop.setText("⏹ " + t["menu_stop"])
             self.btn_folder.setText("📁 " + t["menu_folder"])
             self.btn_copy.setText("🧬 " + t["menu_copy"])
@@ -3441,7 +3667,14 @@ class LauncherMain(QMainWindow):
 
     def open_instance_folder(self):
         if self.selected_instance:
-            os.startfile(self.selected_instance['path'])
+            path = self.selected_instance.get("path", "")
+            if not path:
+                return
+            if not os.path.exists(path):
+                os.makedirs(path, exist_ok=True)
+                for rel in ["mods", "resourcepacks", "shaderpacks", "saves", "screenshots"]:
+                    os.makedirs(os.path.join(path, rel), exist_ok=True)
+            os.startfile(path)
 
     def import_instance_zip(self):
         zip_path, _ = QFileDialog.getOpenFileName(self, "Импорт установки из ZIP", "", "ZIP (*.zip)")
@@ -3561,7 +3794,7 @@ class LauncherMain(QMainWindow):
         self.download_items.append(task)
         if len(self.download_items) > 300:
             self.download_items = self.download_items[-300:]
-        self._refresh_downloads_view()
+        self._ui_call(self._refresh_downloads_view)
         return task["id"]
 
     def _download_task_progress(self, task_id, done):
@@ -3569,7 +3802,7 @@ class LauncherMain(QMainWindow):
             if task.get("id") == task_id:
                 task["done"] = int(done or 0)
                 break
-        self._refresh_downloads_view()
+        self._ui_call(self._refresh_downloads_view)
 
     def _download_task_finish(self, task_id, ok=True, error=""):
         for task in self.download_items:
@@ -3577,12 +3810,31 @@ class LauncherMain(QMainWindow):
                 task["status"] = "done" if ok else "error"
                 task["error"] = str(error or "")
                 break
-        self._refresh_downloads_view()
+        self._ui_call(self._refresh_downloads_view)
 
     def _refresh_downloads_view(self):
         if self.download_list is None:
             return
         self.download_list.clear()
+        active = next((t for t in reversed(self.download_items) if t.get("status") == "in_progress"), None)
+        if hasattr(self, "download_title_lbl") and self.download_title_lbl is not None:
+            if active:
+                self.download_title_lbl.setText(active.get("title", "Загрузка"))
+            else:
+                self.download_title_lbl.setText("Нет активных загрузок")
+        if hasattr(self, "download_pbar") and self.download_pbar is not None:
+            if active:
+                total = int(active.get("total", 0))
+                done = int(active.get("done", 0))
+                if active.get("unit") == "percent":
+                    pct = max(0, min(100, done))
+                elif total > 0:
+                    pct = int((done * 100) / total) if done <= total else 100
+                else:
+                    pct = 0
+                self.download_pbar.setValue(pct)
+            else:
+                self.download_pbar.setValue(0)
         for task in reversed(self.download_items):
             status = {"in_progress": "⏳", "done": "✅", "error": "❌"}.get(task.get("status"), "•")
             total = int(task.get("total", 0))
@@ -3610,20 +3862,27 @@ class LauncherMain(QMainWindow):
             with urllib.request.urlopen(req, timeout=timeout) as response, open(target_path, "wb") as out:
                 total = int(response.headers.get("Content-Length", "0") or "0")
                 if total > 0:
-                    for task in self.download_items:
-                        if task.get("id") == task_id:
-                            task["total"] = total
-                            break
-                    self._refresh_downloads_view()
+                    def set_total():
+                        for task in self.download_items:
+                            if task.get("id") == task_id:
+                                task["total"] = total
+                                break
+                        self._refresh_downloads_view()
+                    self._ui_call(set_total)
                 downloaded = 0
+                last_ui = time.time()
                 while True:
-                    chunk = response.read(65536)
+                    chunk = response.read(262144)
                     if not chunk:
                         break
                     out.write(chunk)
                     downloaded += len(chunk)
-                    self._download_task_progress(task_id, downloaded)
-                    QApplication.processEvents()
+                    now = time.time()
+                    if (now - last_ui) > 0.15 or (total > 0 and downloaded >= total):
+                        self._download_task_progress(task_id, downloaded)
+                        last_ui = now
+                        if QThread.currentThread() == QApplication.instance().thread():
+                            QApplication.processEvents()
             self._download_task_finish(task_id, ok=True)
         except Exception as e:
             self._download_task_finish(task_id, ok=False, error=str(e))
@@ -3645,6 +3904,15 @@ class LauncherMain(QMainWindow):
             QPushButton { background:#252525; color:white; border:1px solid #333; border-radius:8px; padding:8px; }
         """)
         l = QVBoxLayout(self.download_dialog)
+        self.download_title_lbl = QLabel("Нет активных загрузок")
+        self.download_title_lbl.setStyleSheet("color:#E6E6E6; font-weight:700;")
+        self.download_pbar = QProgressBar()
+        self.download_pbar.setRange(0, 100)
+        self.download_pbar.setValue(0)
+        self.download_pbar.setTextVisible(True)
+        self.download_pbar.setStyleSheet("QProgressBar{background:#1A1A1A;border-radius:4px;height:18px;} QProgressBar::chunk{background:#7FE45A;}")
+        l.addWidget(self.download_title_lbl)
+        l.addWidget(self.download_pbar)
         self.download_list = QListWidget()
         l.addWidget(self.download_list)
         hb = QHBoxLayout()
@@ -3656,7 +3924,12 @@ class LauncherMain(QMainWindow):
         hb.addStretch()
         hb.addWidget(close)
         l.addLayout(hb)
-        self.download_dialog.finished.connect(lambda _: (setattr(self, "download_dialog", None), setattr(self, "download_list", None)))
+        self.download_dialog.finished.connect(lambda _: (
+            setattr(self, "download_dialog", None),
+            setattr(self, "download_list", None),
+            setattr(self, "download_title_lbl", None),
+            setattr(self, "download_pbar", None)
+        ))
         self._refresh_downloads_view()
         self.download_dialog.show()
 
@@ -4038,6 +4311,61 @@ $Shortcut.Save()
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось применить профиль: {e}")
 
+    def _crash_hints(self, text):
+        t = (text or "").lower()
+        hints = []
+
+        def add(title, body):
+            hints.append((title, body))
+
+        if "outofmemoryerror" in t or "java heap space" in t or "gc overhead limit exceeded" in t:
+            add(
+                "Недостаточно памяти",
+                "Увеличьте RAM в настройках лаунчера и убедитесь, что используется 64‑битная Java."
+            )
+        if "glfw error 65542" in t or ("opengl" in t and "error" in t):
+            add(
+                "Проблема с OpenGL/драйверами",
+                "Обновите драйверы видеокарты, отключите шейдеры и проверьте запуск на интегрированной/дискретной GPU."
+            )
+        if "modresolutionexception" in t or "found duplicate mod" in t or ("duplicate" in t and "mod" in t):
+            add(
+                "Конфликт модов или дубликаты",
+                "Удалите дубликаты .jar и проверьте совместимость версий модов между собой."
+            )
+        if "mixin apply failed" in t or ("mixin" in t and "failed" in t):
+            add(
+                "Несовместимость мода (Mixin)",
+                "Обновите проблемный мод или используйте версию, совместимую с текущей версией Minecraft/лоадера."
+            )
+        if "nosuchmethoderror" in t or "noclassdeffounderror" in t or "classnotfoundexception" in t:
+            add(
+                "Несовместимые версии модов/зависимостей",
+                "Проверьте, что все моды подходят под вашу версию Minecraft и лоадер, и что зависимости установлены."
+            )
+        if "could not find required mod" in t or ("requires" in t and "mod" in t):
+            add(
+                "Не хватает зависимости",
+                "Добавьте указанный в отчете мод‑зависимость подходящей версии."
+            )
+        if "optifine" in t and ("fabric" in t or "quilt" in t):
+            add(
+                "OptiFine и Fabric/Quilt",
+                "Попробуйте Sodium + Iris вместо OptiFine, или используйте связку OptiFabric."
+            )
+        if "failed to load mods" in t or "errors during mod loading" in t:
+            add(
+                "Ошибка загрузки модов",
+                "Временно отключите моды и включайте по одному, чтобы найти проблемный."
+            )
+
+        if not hints:
+            add(
+                "Общие шаги",
+                "Запустите без модов, обновите Java/драйверы и проверьте, что версия Minecraft совпадает с версиями модов."
+            )
+        return hints
+
     def open_crash_reports(self):
         if not self.selected_instance:
             return
@@ -4047,12 +4375,22 @@ $Shortcut.Save()
         d = QDialog(self)
         d.setWindowTitle(f"Crash-отчеты: {inst.get('name', 'Unnamed')}")
         d.resize(900, 560)
+        pal = self.theme_palette()
         d.setStyleSheet("""
-            QDialog { background:#121212; color:white; font-family:'Segoe UI'; }
-            QListWidget { background:#1A1A1A; color:#EEE; border:1px solid #333; border-radius:8px; }
-            QTextEdit { background:#171717; color:#DDD; border:1px solid #333; border-radius:8px; }
-            QPushButton { background:#252525; color:white; border:1px solid #333; border-radius:8px; padding:8px; }
-        """)
+            QDialog { background:%(bg)s; color:%(text)s; font-family:'Segoe UI'; }
+            QListWidget { background:%(input_bg)s; color:%(input_text)s; border:1px solid %(border)s; border-radius:8px; }
+            QTextEdit { background:%(input_bg)s; color:%(input_text)s; border:1px solid %(border)s; border-radius:8px; }
+            QPushButton { background:%(button_bg)s; color:%(text)s; border:1px solid %(border)s; border-radius:8px; padding:8px; }
+            QPushButton:hover { background:%(button_hover)s; }
+        """ % {
+            "bg": pal["bg"],
+            "text": pal["text"],
+            "input_bg": pal["input_bg"],
+            "input_text": pal["input_text"],
+            "border": pal["border"],
+            "button_bg": pal["button_bg"],
+            "button_hover": pal["button_hover"]
+        })
         root = QHBoxLayout(d)
         left = QVBoxLayout()
         lst = QListWidget()
@@ -4062,9 +4400,43 @@ $Shortcut.Save()
         delete = QPushButton("Удалить")
         hb.addWidget(open_dir); hb.addWidget(delete)
         left.addLayout(hb)
-        txt = QTextEdit(); txt.setReadOnly(True)
         root.addLayout(left, 1)
-        root.addWidget(txt, 2)
+
+        right_split = QSplitter(Qt.Orientation.Vertical)
+
+        report_wrap = QWidget()
+        report_l = QVBoxLayout(report_wrap)
+        report_l.setContentsMargins(0, 0, 0, 0)
+        report_label = QLabel("Отчет")
+        report_label.setStyleSheet("color:#9AA0A6; font-weight:700;")
+        txt = QTextEdit(); txt.setReadOnly(True)
+        report_buttons = QHBoxLayout()
+        copy_report = QPushButton("Копировать отчет")
+        report_buttons.addStretch()
+        report_buttons.addWidget(copy_report)
+        report_l.addWidget(report_label)
+        report_l.addWidget(txt)
+        report_l.addLayout(report_buttons)
+
+        advice_wrap = QWidget()
+        advice_l = QVBoxLayout(advice_wrap)
+        advice_l.setContentsMargins(0, 0, 0, 0)
+        advice_label = QLabel("Советы")
+        advice_label.setStyleSheet("color:#9AA0A6; font-weight:700;")
+        advice_txt = QTextEdit(); advice_txt.setReadOnly(True)
+        advice_buttons = QHBoxLayout()
+        copy_advice = QPushButton("Копировать советы")
+        advice_buttons.addStretch()
+        advice_buttons.addWidget(copy_advice)
+        advice_l.addWidget(advice_label)
+        advice_l.addWidget(advice_txt)
+        advice_l.addLayout(advice_buttons)
+
+        right_split.addWidget(report_wrap)
+        right_split.addWidget(advice_wrap)
+        right_split.setSizes([360, 180])
+
+        root.addWidget(right_split, 2)
 
         files = []
         if os.path.exists(crash_dir):
@@ -4082,13 +4454,19 @@ $Shortcut.Save()
             row = lst.currentRow()
             if row < 0 or row >= len(files):
                 txt.setPlainText("")
+                advice_txt.setPlainText("")
                 return
             p = files[row]
             try:
                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    txt.setPlainText(f.read())
+                    content = f.read()
+                    txt.setPlainText(content)
+                hints = self._crash_hints(content)
+                advice_text = "\n\n".join([f"• {t}\n  {b}" for t, b in hints])
+                advice_txt.setPlainText(advice_text)
             except Exception as e:
                 txt.setPlainText(str(e))
+                advice_txt.setPlainText("")
 
         def del_sel():
             row = lst.currentRow()
@@ -4106,6 +4484,8 @@ $Shortcut.Save()
         lst.currentRowChanged.connect(lambda *_: show_sel())
         open_dir.clicked.connect(lambda: os.startfile(crash_dir) if os.path.exists(crash_dir) else None)
         delete.clicked.connect(del_sel)
+        copy_report.clicked.connect(lambda: QApplication.clipboard().setText(txt.toPlainText()))
+        copy_advice.clicked.connect(lambda: QApplication.clipboard().setText(advice_txt.toPlainText()))
         d.exec()
 
     def repair_selected_instance(self):
@@ -4260,13 +4640,24 @@ $Shortcut.Save()
         dlg.exec()
 
     def log_event(self, text):
-        ts = datetime.now().strftime("%H:%M:%S")
-        entry = f"[{ts}] {text}"
-        self.install_logs.append(entry)
-        if len(self.install_logs) > 500:
-            self.install_logs = self.install_logs[-500:]
-        if hasattr(self, "log_text") and self.log_text is not None:
-            self.log_text.append(entry)
+        def do_log():
+            ts = datetime.now().strftime("%H:%M:%S")
+            entry = f"[{ts}] {text}"
+            self.install_logs.append(entry)
+            if len(self.install_logs) > 500:
+                self.install_logs = self.install_logs[-500:]
+            if hasattr(self, "log_text") and self.log_text is not None:
+                self.log_text.append(entry)
+        self._ui_call(do_log)
+
+    def _ui_call(self, fn):
+        try:
+            if QThread.currentThread() == QApplication.instance().thread():
+                fn()
+            else:
+                QTimer.singleShot(0, fn)
+        except Exception:
+            fn()
 
     def open_install_logs(self):
         if hasattr(self, "log_dialog") and self.log_dialog is not None:
@@ -4330,11 +4721,18 @@ $Shortcut.Save()
             return
         self.pbar.setVisible(True); self.play_btn.setEnabled(False)
         launch_data = dict(self.selected_instance)
-        if bool(self.settings.get("auto_ram", True)):
-            launch_data["ram_mb"] = int(self.recommended_ram_mb())
-            self.log_event(f"Автоподбор RAM: {launch_data['ram_mb']} MB")
+        if self.selected_instance.get("ram_override"):
+            launch_data["ram_min_mb"] = int(self.selected_instance.get("ram_min_mb", 1024))
+            launch_data["ram_max_mb"] = int(self.selected_instance.get("ram_max_mb", 2048))
+            self.log_event(f"RAM (override): {launch_data['ram_min_mb']}–{launch_data['ram_max_mb']} MB")
         else:
-            launch_data["ram_mb"] = int(self.settings.get("ram_mb", 2048))
+            if bool(self.settings.get("auto_ram", True)):
+                launch_data["ram_max_mb"] = int(self.recommended_ram_mb())
+                self.log_event(f"Автоподбор RAM: {launch_data['ram_max_mb']} MB")
+            else:
+                launch_data["ram_max_mb"] = int(self.settings.get("ram_mb", 2048))
+            launch_data["ram_min_mb"] = max(256, min(1024, int(launch_data["ram_max_mb"])))
+        launch_data["jvm_args"] = self.selected_instance.get("jvm_args", "")
         launch_data["account"] = account
         launch_data["java_path"] = java_path
         self.launch_started_at = time.time()
@@ -4508,6 +4906,11 @@ $Shortcut.Save()
             if not ok_space:
                 QMessageBox.warning(self, "Недостаточно места", f"Свободно только {free_gb:.2f} GB. Нужно минимум ~2 GB.")
                 return
+            inst_path = data.get("path", "")
+            if inst_path:
+                os.makedirs(inst_path, exist_ok=True)
+                for rel in ["mods", "resourcepacks", "shaderpacks", "saves", "screenshots"]:
+                    os.makedirs(os.path.join(inst_path, rel), exist_ok=True)
             g = data['group']
             if g not in self.instance_data: self.instance_data[g] = []
             self.instance_data[g].append(data); self.save_data(); self.refresh_grid()
@@ -4517,7 +4920,7 @@ $Shortcut.Save()
         for g in self.instance_data:
             self.instance_data[g] = [i for i in self.instance_data[g] if i.get('path') != self.selected_instance.get('path')]
         self.selected_instance = None
-        for b in [self.btn_launch, self.btn_stop, self.btn_folder, self.btn_copy, self.btn_shortcut, self.btn_delete]:
+        for b in [self.btn_stop, self.btn_folder, self.btn_copy, self.btn_shortcut, self.btn_delete]:
             b.setEnabled(False)
         self.edit_btn.setEnabled(False)
         self._update_edit_menu_state()
@@ -4528,8 +4931,18 @@ $Shortcut.Save()
         with open(DATA_FILE, "w", encoding="utf-8") as f: json.dump(self.instance_data, f, indent=4)
     def load_data(self):
         if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                self.instance_data = json.load(f); self.refresh_grid()
+            try:
+                with open(DATA_FILE, "r", encoding="utf-8") as f:
+                    self.instance_data = json.load(f)
+                self.refresh_grid()
+            except Exception:
+                try:
+                    bad = DATA_FILE + ".bad"
+                    if os.path.exists(bad):
+                        os.remove(bad)
+                    os.replace(DATA_FILE, bad)
+                except Exception:
+                    pass
 
 class EditMenuDialog(QDialog):
     def __init__(self, parent):
@@ -4647,19 +5060,185 @@ class EditMenuDialog(QDialog):
 
     def _page_params(self, t):
         w, l = self._panel(t.get("edit_menu_params", "Параметры"))
+        inst = self.parent.selected_instance or {}
+        if not inst:
+            l.addWidget(QLabel("Установка не выбрана."))
+            l.addStretch()
+            return w
+
+        def set_inst(key, value):
+            self.parent.set_instance_prop(inst.get("path", ""), key, value)
+            self.parent.save_data()
+            self.parent.refresh_grid()
+
+        top_row = QHBoxLayout()
         b1 = QPushButton("Открыть настройки"); b1.clicked.connect(self.parent.show_settings_page)
         b2 = QPushButton("Профиль графики"); b2.clicked.connect(self.parent.open_graphics_profile_dialog)
         b3 = QPushButton("Цвет метки"); b3.clicked.connect(self.parent.set_color_label_selected)
         b4 = QPushButton("В избранное"); b4.clicked.connect(self.parent.toggle_favorite_selected)
-        for b in [b1, b2, b3, b4]: l.addWidget(b)
-        l.addStretch()
+        for b in [b1, b2, b3, b4]: top_row.addWidget(b)
+        top_row.addStretch()
+        l.addLayout(top_row)
+
+        tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #333; top: -1px; }
+            QTabBar::tab { background:#1A1A1A; color:#AAA; padding:8px 12px; border:1px solid #333; }
+            QTabBar::tab:selected { color:white; background:#222; }
+            QLabel { color:#DDD; }
+            QLineEdit, QComboBox, QSpinBox {
+                background:#1A1A1A; color:white; border:1px solid #333; border-radius:8px; padding:8px;
+            }
+            QPushButton { background:#252525; color:white; border:1px solid #333; border-radius:8px; padding:8px; }
+            QPushButton:hover { background:#2D2D2D; }
+            QCheckBox { color:white; }
+        """)
+        l.addWidget(tabs, 1)
+
+        java_tab = QWidget()
+        jl = QVBoxLayout(java_tab)
+        use_custom = QCheckBox("Java installation")
+        current_java = (inst.get("java_path", "") or "auto").strip()
+        use_custom.setChecked(bool(current_java and current_java.lower() != "auto"))
+        jl.addWidget(use_custom)
+        path_row = QHBoxLayout()
+        java_path = QLineEdit("" if current_java.lower() == "auto" else current_java)
+        java_path.setPlaceholderText("javaw.exe / java.exe")
+        browse = QPushButton("Browse")
+        auto = QPushButton("Auto-detect")
+        download = QPushButton("Download Java")
+        test = QPushButton("Test")
+        for b in [browse, auto, download, test]:
+            path_row.addWidget(b)
+        jl.addWidget(java_path)
+        jl.addLayout(path_row)
+        jl.addStretch()
+        tabs.addTab(java_tab, "Java")
+
+        def sync_java_controls():
+            enabled = use_custom.isChecked()
+            java_path.setEnabled(enabled)
+            browse.setEnabled(enabled)
+            test.setEnabled(enabled)
+            auto.setEnabled(True)
+            download.setEnabled(True)
+        sync_java_controls()
+
+        def set_java_path(path_value):
+            val = (path_value or "").strip()
+            if not val:
+                val = "auto"
+            set_inst("java_path", val)
+            java_path.setText("" if val == "auto" else val)
+            self.parent.select_instance(inst)
+
+        use_custom.stateChanged.connect(lambda *_: (sync_java_controls(), set_java_path(java_path.text() if use_custom.isChecked() else "auto")))
+        def pick_java():
+            path, _ = QFileDialog.getOpenFileName(self, "Выбрать Java", "", "Java (javaw.exe java.exe)")
+            if path:
+                set_java_path(path)
+        browse.clicked.connect(pick_java)
+        auto.clicked.connect(lambda: set_java_path("auto"))
+        download.clicked.connect(lambda: (
+            lambda p: set_java_path(p) if p else None
+        )(self.parent.ensure_java_downloaded(self.parent.required_java_major(inst))))
+        def do_test():
+            path = (java_path.text() or "").strip()
+            if not path or path.lower() == "auto":
+                path = self.parent.resolve_java_for_instance(inst, parent=self.parent) or ""
+            ver, major = self.parent._java_version_info(path) if path else ("", 0)
+            QMessageBox.information(self, "Java", f"Java: {ver or 'unknown'} (major {major})")
+        test.clicked.connect(do_test)
+
+        # Memory tab
+        mem_tab = QWidget()
+        ml = QVBoxLayout(mem_tab)
+        override = QCheckBox("Переопределить память")
+        override.setChecked(bool(inst.get("ram_override", False)))
+        ml.addWidget(override)
+        mem_row = QHBoxLayout()
+        min_spin = QSpinBox(); min_spin.setRange(256, 65536); min_spin.setSuffix(" MB")
+        max_spin = QSpinBox(); max_spin.setRange(256, 65536); max_spin.setSuffix(" MB")
+        min_spin.setValue(int(inst.get("ram_min_mb", 1024)))
+        max_spin.setValue(int(inst.get("ram_max_mb", 2048)))
+        mem_row.addWidget(QLabel("Мин:")); mem_row.addWidget(min_spin)
+        mem_row.addWidget(QLabel("Макс:")); mem_row.addWidget(max_spin)
+        ml.addLayout(mem_row)
+        ml.addStretch()
+        tabs.addTab(mem_tab, "Memory")
+
+        def sync_mem_controls():
+            enabled = override.isChecked()
+            min_spin.setEnabled(enabled)
+            max_spin.setEnabled(enabled)
+        sync_mem_controls()
+
+        def save_mem():
+            vmin = int(min_spin.value())
+            vmax = int(max_spin.value())
+            if vmin > vmax:
+                vmin, vmax = vmax, vmin
+            set_inst("ram_override", bool(override.isChecked()))
+            set_inst("ram_min_mb", vmin)
+            set_inst("ram_max_mb", vmax)
+
+        override.stateChanged.connect(lambda *_: (sync_mem_controls(), save_mem()))
+        min_spin.valueChanged.connect(lambda *_: save_mem())
+        max_spin.valueChanged.connect(lambda *_: save_mem())
+
+        # JVM args tab
+        args_tab = QWidget()
+        al = QVBoxLayout(args_tab)
+        args_edit = QLineEdit(inst.get("jvm_args", ""))
+        args_edit.setPlaceholderText("-Dfile.encoding=UTF-8 -XX:+UseG1GC")
+        save_args = QPushButton("Сохранить аргументы")
+        save_args.clicked.connect(lambda: set_inst("jvm_args", args_edit.text().strip()))
+        al.addWidget(QLabel("Java arguments"))
+        al.addWidget(args_edit)
+        al.addWidget(save_args)
+        al.addStretch()
+        tabs.addTab(args_tab, "Custom commands")
+
         return w
 
     def _page_logs(self, t):
         w, l = self._panel(t.get("edit_menu_logs", "Other logs"))
         b1 = QPushButton("Логи установки"); b1.clicked.connect(self.parent.open_install_logs)
         b2 = QPushButton("Crash-отчеты"); b2.clicked.connect(self.parent.open_crash_reports)
-        l.addWidget(b1); l.addWidget(b2); l.addStretch()
+        l.addWidget(b1); l.addWidget(b2)
+
+        inst = self.parent.selected_instance or {}
+        base = inst.get("path", "")
+        crash_dir = os.path.join(base, "crash-reports")
+        files = []
+        if os.path.exists(crash_dir):
+            for fn in os.listdir(crash_dir):
+                if fn.lower().endswith((".txt", ".log")):
+                    files.append(os.path.join(crash_dir, fn))
+        if os.path.exists(base):
+            for fn in os.listdir(base):
+                if fn.lower().startswith("hs_err_pid") and fn.lower().endswith(".log"):
+                    files.append(os.path.join(base, fn))
+        files = sorted(files, key=lambda p: os.path.getmtime(p), reverse=True)
+
+        if files:
+            l.addWidget(QLabel("Crash-отчеты:"))
+            lst = QListWidget()
+            for p in files[:20]:
+                lst.addItem(os.path.basename(p))
+            l.addWidget(lst)
+            open_sel = QPushButton("Открыть выбранный отчет")
+            def open_selected():
+                row = lst.currentRow()
+                if row < 0:
+                    return
+                os.startfile(files[row])
+            open_sel.clicked.connect(open_selected)
+            l.addWidget(open_sel)
+        else:
+            l.addWidget(QLabel("Crash-отчетов не найдено."))
+
+        l.addStretch()
         return w
 
     def _page_more(self, t):
@@ -5038,4 +5617,3 @@ if __name__ == "__main__":
     if auto_launch_instance:
         QTimer.singleShot(400, lambda p=auto_launch_instance: w.launch_instance_by_path(p))
     sys.exit(app.exec())
-
